@@ -1,0 +1,16 @@
+Question,Relevance,Faithfulness,Context_precision,Context_recall
+What does the 'people with disabilities symbol' refer to in the context of the Transport Operations (Road Use Management—Road Rules) Regulation 2009?,high,True,,
+What does the 'people with disabilities symbol' refer to in the context of the Transport Operations (Road Use Management—Road Rules) Regulation 2009?,high,True,,
+What does subsection (1) not apply to when a driver is stationary?,high,True,,
+What should be done when approaching and entering a roundabout?,high,True,,
+What does the 'people with disabilities symbol' refer to in the context of the Transport Operations (Road Use Management—Road Rules) Regulation 2009?,high,True,0.999999999975,1.0
+What does subsection (1) not apply to when a driver is stationary?,high,True,0.0,0.0
+What should be done when approaching and entering a roundabout?,high,True,0.999999999975,1.0
+What documents are required for a practical driving test?,low,False,0.999999999975,1.0
+What does subsection (1) not apply to when a driver is stationary?,high,True,0.0,0.0
+What does subsection (1) not apply to when a driver is stationary?,high,True,0.0,0.0
+What should be done when approaching and entering a roundabout?,high,True,0.999999999975,1.0
+What does subsection (1) not apply to when a driver is stationary?,high,True,0.0,0.0
+What should be done when approaching and entering a roundabout?,high,True,0.999999999975,1.0
+What documents are required for a practical driving test?,low,False,0.999999999975,1.0
+What does the 'people with disabilities symbol' refer to in the context of the Transport Operations (Road Use Management—Road Rules) Regulation 2009?,high,True,0.999999999975,1.0

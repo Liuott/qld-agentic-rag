@@ -1,0 +1,40 @@
+
+========================================================================
+[DEBUG] Question:
+What does a black and white diagram represent in traffic signs?
+
+[DEBUG] Top contexts:
+  [1] traffic-related item or symbol in schedule 4 is in black and
+white, the permitted version of the sign, item or symbol is in
+black and white only.
+(4) If a diagram of a traffic sign, tr affic-related item or symbol in
+a section of this regulation is in black and white and the sign,
+item or symbol is not in black and white only in schedule 2, 3
+or 4, the diagr
+  [2] traffic-related item or symbol in schedule 4 is in black and
+white, the permitted version of the sign, item or symbol is in
+black and white only.
+(4) If a diagram of a traffic sign, tr affic-related item or symbol in
+a section of this regulation is in black and white and the sign,
+item or symbol is not in black and white only in schedule 2, 3
+or 4, the diagr
+  [3] traffic-related item or symbol in schedule 4 is in black and
+white, the permitted version of the sign, item or symbol is in
+black and white only.
+(4) If a diagram of a traffic sign, tr affic-related item or symbol in
+a section of this regulation is in black and white and the sign,
+item or symbol is not in black and white only in schedule 2, 3
+or 4, the diagr
+
+[DEBUG] Answer:
+- Evidence:
+  - traffic-related item or symbol in schedule 4 is in black and
+    white, the permitted version of the sign, item or symbol is in
+    black and white only.
+  - (4) If a diagram of a traffic sign, tr affic-related item or symbol in
+    a section of this regulation is in black and white and the sign,
+    item or symbol is not in black and white only in schedule 2, 3
+    or 4, the diagr
+
+- Answer: A black and white diagram represents a traffic-related item or symbol that is permitted to be in black and white only. Source: <Act/MUTCD, clause #>
+========================================================================

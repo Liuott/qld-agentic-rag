@@ -1,0 +1,17 @@
+python-dotenv
+langchain
+langgraph
+langchain-community
+langchain-ollama
+langchain-chroma
+langchain-huggingface
+chromadb
+ragas
+pandas
+pydantic
+pypdf
+beautifulsoup4
+datasets
+evaluate
+tqdm
+langsmith
