@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints
+.env
+.venv/
+venv/
+# Build
+dist/
+build/
+*.egg-info/
+# Editors/OS
+.DS_Store
+.vscode/
+# Logs & cache
+*.log
+# (按需) 本地向量库/缓存
+chroma/
+vectorstore/
