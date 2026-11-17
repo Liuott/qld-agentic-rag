@@ -104,6 +104,7 @@ class Settings:
     chroma_dir: Path
     collection_name: str
     embedding_model: str
+    hf_endpoint: str
     ollama_base_url: str
     ollama_model: str
     eval_ollama_model: str
@@ -144,6 +145,7 @@ class Settings:
             chroma_dir=_path("CHROMA_DIR", "storage/chroma_db"),
             collection_name=_str("CHROMA_COLLECTION", "qld_rr_docs"),
             embedding_model=_str("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
+            hf_endpoint=_str("HF_ENDPOINT", ""),
             ollama_base_url=_str("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/"),
             ollama_model=_str("OLLAMA_MODEL", "qwen2.5:3b"),
             eval_ollama_model=_str("EVAL_OLLAMA_MODEL", _str("OLLAMA_MODEL", "qwen2.5:3b")),

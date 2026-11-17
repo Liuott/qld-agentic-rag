@@ -76,7 +76,14 @@ class AskOut(BaseModel):
 # --------------------------------------------------------------------------- #
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Warm the heavy objects once, at startup (not at import)."""
+    """Warm the heavy objects once, at startup (not at import).
+
+    Startup must not take the process down. Loading the embedding model needs
+    the HuggingFace weights on disk, and that download is the single most common
+    failure on a fresh machine (see ``HF_ENDPOINT`` in ``.env.example``). When it
+    fails we keep the process up, record why, and let ``/readyz`` and ``/ask``
+    report 503 with an actionable message instead of a bare connection error.
+    """
     settings = get_settings()
     if settings.langsmith_tracing and settings.langsmith_api_key:
         import os
@@ -85,11 +92,25 @@ async def lifespan(app: FastAPI):
         os.environ.setdefault("LANGSMITH_API_KEY", settings.langsmith_api_key)
         os.environ.setdefault("LANGSMITH_PROJECT", settings.langsmith_project)
 
-    logger.info("loading vector store from %s", settings.chroma_dir)
-    app.state.vectorstore = get_vectorstore()
-    app.state.llm = get_llm(temperature=0.0)
-    if vectorstore_is_empty(app.state.vectorstore):
-        logger.warning("vector store is empty -- run `python -m src.ingest` before serving")
+    app.state.error: str | None = None
+    app.state.vectorstore = None
+    app.state.llm = None
+    try:
+        logger.info("loading vector store from %s", settings.chroma_dir)
+        app.state.vectorstore = get_vectorstore()
+        app.state.llm = get_llm(temperature=0.0)
+        if vectorstore_is_empty(app.state.vectorstore):
+            logger.warning("vector store is empty -- run `python -m src.ingest` before serving")
+    except Exception as exc:  # noqa: BLE001 - startup must survive a broken environment
+        app.state.error = f"{type(exc).__name__}: {exc}"
+        logger.error(
+            "startup degraded, /ask will answer 503: %s\n"
+            "hint: the embedding model (%s) is downloaded from HuggingFace on first use; "
+            "set HF_ENDPOINT=https://hf-mirror.com if huggingface.co is unreachable, "
+            "and run `python -m src.ingest` to build the index.",
+            app.state.error,
+            settings.embedding_model,
+        )
     yield
     logger.info("shutting down")
 
@@ -124,14 +145,27 @@ def readyz(request: Request) -> dict[str, Any]:
     return {
         "ready": store is not None and not vectorstore_is_empty(store),
         "chroma_dir": str(get_settings().chroma_dir),
+        "error": getattr(request.app.state, "error", None),
     }
 
 
 @app.post("/ask", response_model=AskOut, dependencies=[Depends(require_api_key)])
 def ask(payload: AskIn, request: Request) -> AskOut:
     settings = get_settings()
-    store = getattr(request.app.state, "vectorstore", None) or get_vectorstore()
-    llm = getattr(request.app.state, "llm", None) or get_llm(temperature=0.0)
+    store = getattr(request.app.state, "vectorstore", None)
+    llm = getattr(request.app.state, "llm", None)
+    if store is None or llm is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "service not ready: "
+                f"{getattr(request.app.state, 'error', None) or 'startup did not complete'}. "
+                "Run `python -m src.ingest` and make sure the embedding model is available "
+                "(set HF_ENDPOINT=https://hf-mirror.com if huggingface.co is unreachable)."
+            ),
+        )
+
+    llm = llm or get_llm(temperature=0.0)
 
     documents = retrieve_documents(
         store,

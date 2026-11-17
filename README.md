@@ -41,6 +41,8 @@ ollama pull qwen2.5:3b
 
 # 3. configuration
 cp .env.example .env        # then edit if needed
+# if huggingface.co is unreachable on your network, add to .env:
+#   HF_ENDPOINT=https://hf-mirror.com
 
 # 4. build the index (PDFs live in data/sources/)
 python -m src.ingest --reset

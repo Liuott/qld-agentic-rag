@@ -10,6 +10,7 @@ one instance per model name.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -22,9 +23,14 @@ def get_embeddings(model_name: str | None = None) -> HuggingFaceEmbeddings:
     """Return a process-wide embedding model for ``model_name``.
 
     The model is loaded lazily on first use; importing this module costs
-    nothing.
+    nothing. If ``HF_ENDPOINT`` is configured (see ``.env.example``) it is
+    exported before the model is fetched, which is what makes the first run work
+    behind networks where ``huggingface.co`` is unreachable.
     """
-    name = model_name or get_settings().embedding_model
+    settings = get_settings()
+    if settings.hf_endpoint:
+        os.environ.setdefault("HF_ENDPOINT", settings.hf_endpoint)
+    name = model_name or settings.embedding_model
     return HuggingFaceEmbeddings(model_name=name)
 
 
