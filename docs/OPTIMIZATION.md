@@ -16,10 +16,13 @@ the diff. Numbers refer to the state of `main` at commit `c1a4e2e`
 | Byte-code committed | `src/**/__pycache__/*.pyc` | untracked |
 | Secrets committed | `.env` with a live LangSmith key (`lsv2_pt_…`) and a Qwen API key (`sk-…`) in a **public** repo | untracked, `.gitignore` hardened, `.env.example` added, rotation steps in `docs/SECURITY.md` |
 
-Effect: `git clone` goes from ~300 MB to a few MB, and no credentials leak.
+Effect: `git clone` goes from ~300 MB to about 20 MB (the two source PDFs), and
+no credentials leak.
 
-> Removing the files from the tip does **not** remove them from history. Run
-> `scripts/purge-history.sh` (git-filter-repo) and **rotate the keys**.
+> Removing the files from the tip does **not** remove them from history. The
+> published history was therefore squashed into a single commit on 2026-11-17
+> (`0eebfa7`) — see `docs/SECURITY.md` for what that does and does not
+> guarantee, and rotate the keys regardless.
 
 ---
 

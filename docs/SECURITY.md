@@ -40,24 +40,36 @@ git check-ignore -v .env
 
 ## 3. Purge the secret from history
 
-`git filter-repo` is the supported tool (install once with
-`pip install git-filter-repo`):
+**Status: done on 2026-11-17.** The published history was replaced by a single
+squashed commit (`0eebfa7`, "chore: v2 repository reset"), so no commit
+reachable from `main` contains `.env`, `.venv/`, `storage/` or `__pycache__/`
+any more. `main` is now 49 files / ~20 MB.
+
+Two caveats:
+
+* GitHub keeps **unreachable** objects around until it garbage-collects them, so
+  the old blobs (including the leaked keys) can still be fetched by their SHA
+  for a while. `git cat-file -p <old-sha>` on a clone is enough to retrieve
+  them. That is why rotating the keys in step 1 is not optional.
+  To have them purged immediately, open a GitHub Support ticket and point at
+  the repository and the commit range — only the repository owner can do this.
+* The repository size reported by the API stays at the old value (~292 MB) until
+  that collection happens. Do not be surprised if it looks unchanged.
+
+For reference (other repositories, or if you ever restore the old history), the
+generic rewrite recipe is `git filter-repo` via:
 
 ```bash
+pip install git-filter-repo
 bash scripts/purge-history.sh
-```
-
-The script rewrites every commit to drop `.venv/`, `storage/`, `__pycache__/`
-and `.env`, then prints the resulting repository size. **This rewrites commit
-ids** — coordinate with anyone who has a clone, then force-push:
-
-```bash
 git push --force-with-lease origin main
 ```
 
-If other people already cloned the repository, ask them to delete their copy
-(GitHub's cached views / forks cannot be rewritten from your side; contact
-GitHub Support if the key was live for a long time).
+It rewrites every commit to drop `.venv/`, `storage/`, `__pycache__/` and
+`.env`. **This changes every commit id** — coordinate with anyone who has a
+clone. It was not used here because the history could not be downloaded in full
+over this network; squashing achieved the same result with the tree that was
+already verified locally.
 
 ## 4. Prevent recurrence
 
