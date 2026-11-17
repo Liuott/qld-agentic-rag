@@ -217,7 +217,7 @@ def evaluate_llm_metric(
                     if str(key).lower() == str(metric_key).lower():
                         return {metric_key: float(value)}
                 for value in aggregate.values:
-                    if isinstance(value, (int, float)):
+                    if isinstance(value, int | float):
                         return {metric_key: float(value)}
                 return None
             except Exception:
