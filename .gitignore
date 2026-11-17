@@ -1,0 +1,49 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments -- never commit these (this repo used to ship a 900 MB .venv)
+.venv/
+venv/
+env/
+ENV/
+
+# Secrets -- never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local vector store / index artifacts
+storage/
+chroma/
+vectorstore/
+*.sqlite3
+
+# Regenerable evaluation artefacts (the test set itself IS tracked)
+data/eval/run_answers.csv
+data/eval/last_debug.txt
+
+# Model / dataset caches
+.cache/
+hf_cache/
+.ollama/
+models/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+
+# Logs & notebooks
+*.log
+.ipynb_checkpoints/

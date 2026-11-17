@@ -1,0 +1,44 @@
+# Local stack: Ollama + the RAG API.
+#
+#   docker compose up -d ollama
+#   docker compose exec ollama ollama pull qwen2.5:3b
+#   docker compose run --rm api python -m src.ingest --reset
+#   docker compose up -d api
+#
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  api:
+    build: .
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      EVAL_OLLAMA_MODEL: ${EVAL_OLLAMA_MODEL:-qwen2.5:3b}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+      CHROMA_DIR: /app/storage/chroma_db
+      HF_HOME: /models
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      SERVE_API_KEY: ${SERVE_API_KEY:-}
+    ports:
+      - "8008:8008"
+    volumes:
+      - ./data:/app/data:ro
+      - ./storage:/app/storage
+      - model-cache:/models
+
+volumes:
+  ollama-models:
+  model-cache:

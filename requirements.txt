@@ -1,0 +1,49 @@
+# ---------------------------------------------------------------------------
+# Pinned to the versions the project was actually developed against
+# (recovered from the committed .venv, Python 3.10 / linux-x86_64).
+# Keeping them equal makes experiment CSVs reproducible.
+# ---------------------------------------------------------------------------
+
+# --- core RAG stack ---
+langchain==0.3.27
+langchain-core==0.3.76
+langchain-community==0.3.29
+langchain-text-splitters==0.3.11
+langchain-ollama==0.3.7
+langchain-huggingface==0.3.1
+langchain-chroma==0.2.5
+langgraph==0.6.7
+langgraph-checkpoint==2.1.1
+langgraph-prebuilt==0.6.4
+
+# --- vector store / embeddings ---
+chromadb==1.0.20
+numpy==2.2.6
+tokenizers==0.22.0
+huggingface-hub==0.34.4
+
+# --- evaluation ---
+ragas==0.3.4
+datasets==4.0.0
+evaluate==0.4.5
+langsmith==0.4.27
+pandas==2.3.2
+tqdm==4.67.1
+
+# --- documents / config ---
+pypdf==6.0.0
+beautifulsoup4==4.13.5
+python-dotenv==1.1.1
+pydantic==2.11.7
+pydantic-settings==2.10.1
+
+# --- HTTP API ---
+# NOTE: fastapi was never listed in requirements.txt even though serve_api.py
+# imports it; the committed .venv did not contain it either. Pinned here.
+fastapi==0.115.14
+uvicorn[standard]==0.35.0
+
+# --- re-ranking (optional at runtime; the pipeline degrades gracefully) ---
+# NOTE: also missing from the original requirements.txt. Without it,
+# `--rerank` silently fell back to plain similarity ranking.
+sentence-transformers==5.1.0
