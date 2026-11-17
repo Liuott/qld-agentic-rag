@@ -207,8 +207,13 @@ def give_up(state: AgentState) -> dict[str, Any]:
     return generate(state)
 
 
-@lru_cache(maxsize=2)
 def _rewrite_chain(llm: Any):
+    """Wire the "rewrite the question" chain.
+
+    Deliberately not cached: LangChain model objects are pydantic models and are
+    not guaranteed to be hashable, so an ``lru_cache`` keyed on ``llm`` can raise
+    ``TypeError`` at call time. Composing the chain is a few microseconds.
+    """
     return ChatPromptTemplate.from_messages([("human", "{prompt}")]) | llm
 
 

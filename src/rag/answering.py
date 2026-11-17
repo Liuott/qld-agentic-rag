@@ -1,8 +1,7 @@
 """Answer generation: prompt -> LLM -> plain text.
 
 ``answer_question`` keeps the original call signature ``(llm, context, question)``
-so the existing evaluation scripts keep working unchanged, but the chain is now
-built once per (prompt, llm) pair instead of on every call.
+so the existing evaluation scripts keep working unchanged.
 """
 
 from __future__ import annotations
@@ -26,7 +25,12 @@ def get_llm(
     json_mode: bool = False,
     seed: int | None = None,
 ) -> ChatOllama:
-    """Return a cached ``ChatOllama`` client (one per parameter combination)."""
+    """Return a cached ``ChatOllama`` client (one per parameter combination).
+
+    Building the client re-reads a config and constructs a pydantic model, which
+    is cheap but not free; more importantly, one client per configuration keeps
+    the HTTP session pool warm across questions.
+    """
     settings = get_settings()
     kwargs: dict = {
         "model": model or settings.ollama_model,
@@ -43,19 +47,21 @@ def get_llm(
     return ChatOllama(**kwargs)
 
 
-@lru_cache(maxsize=8)
-def _build_chain(prompt: BasePromptTemplate, llm: BaseLanguageModel):
-    return prompt | llm | StrOutputParser()
-
-
 def answer_question(
     llm: BaseLanguageModel,
     ctx_joined: str,
     question: str,
     prompt: BasePromptTemplate | None = None,
 ) -> str:
-    """Answer ``question`` from ``ctx_joined`` using ``llm``."""
-    chain = _build_chain(prompt or RAG_ANSWER_PROMPT, llm)
+    """Answer ``question`` from ``ctx_joined`` using ``llm``.
+
+    The LCEL chain is composed per call on purpose: composition is pure object
+    wiring (microseconds, dwarfed by the model call), whereas caching it would
+    require the prompt and LLM objects to be hashable -- pydantic models in the
+    LangChain stack are not guaranteed to be, and an unhashable argument would
+    raise ``TypeError`` at call time.
+    """
+    chain = (prompt or RAG_ANSWER_PROMPT) | llm | StrOutputParser()
     return chain.invoke({"context": ctx_joined, "question": question})
 
 
