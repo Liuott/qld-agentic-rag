@@ -1,596 +1,586 @@
-# -*- coding: utf-8 -*-
-"""
-Stable RAGAS evaluation for Agentic RAG (no OpenAI dependency by default)
+"""RAGAS evaluation for the QLD Agentic RAG corpus (no OpenAI dependency).
+
+Two modes
+---------
+* default -- fast, non-LLM metrics only (context precision / recall against the
+  reference contexts);
+* ``--full`` -- additionally asks Ollama to score faithfulness and answer
+  relevance.
+
+Optional self-evaluation loop
+-----------------------------
+``--loop`` turns on the "critic" that ``eval_newv.py`` used to duplicate: after
+an answer is produced, the evidence bullets are checked against the retrieved
+context; if the hit ratio is too low (or ``--judge`` says the answer is not
+grounded) the retrieval is widened and the answer is regenerated.  The variant
+that scores better wins.
+
+Outputs
+-------
+* ``data/eval/run_answers.csv`` -- answer cache (keyed by question + settings);
+* ``experiments/ragas_row_scores.csv`` -- per-row context precision / recall;
+* ``experiments/ab_results.csv`` -- one aggregated row per run.
+
+Examples
+--------
+    python -m src.eval.eval_ragas --limit 30 --full false
+    python -m src.eval.eval_ragas --row_idx 2 --full false
+    python -m src.eval.eval_ragas --limit 30 --loop --judge
 """
 
 from __future__ import annotations
-import os, csv, math, argparse, time, random
-from typing import List, Tuple
-import pandas as pd
-from pandas.errors import EmptyDataError
-from tqdm import tqdm
-from datasets import Dataset
 
-from langchain_huggingface import HuggingFaceEmbeddings as LCHFEmbeddings
-from langchain_chroma import Chroma
-from langchain_ollama import ChatOllama
+import argparse
+import csv
+import json
+import os
+import random
+import time
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+# ---- RAGAS (hard dependency of this script) -------------------------------- #
+from datasets import Dataset
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-
-from ragas import evaluate
-
-# ---- Non-LLM metrics (no LLM dependency) ----
-try:
-    from ragas.metrics import NonLLMContextPrecisionWithReference, NonLLMContextRecall
-except Exception:
-    from ragas.metrics import context_precision as NonLLMContextPrecisionWithReference
-    from ragas.metrics import context_recall as NonLLMContextRecall
-
-# ---- Optional LLM metrics (only used with --full) ----
-try:
-    from ragas.metrics import faithfulness, answer_relevancy
-except Exception:
-    faithfulness = None
-    answer_relevancy = None
-
-# ---- RAGAS-native HF embeddings (prevents defaulting to OpenAI) ----
-from ragas.embeddings import HuggingFaceEmbeddings as RagasHFEmbeddings
-
-# ---- Wrap LangChain LLM for RAGAS (only for --full) ----
-try:
-    from ragas.llms import LangchainLLMWrapper as LangchainLLM
-except Exception:
-    try:
-        from ragas.integrations.langchain import LangchainLLM as LangchainLLM
-    except Exception:
-        LangchainLLM = None  # if missing, disallow --full
-
-from ragas.embeddings import LangchainEmbeddingsWrapper
 from langchain_huggingface import HuggingFaceEmbeddings as LcHFEmb
+from pandas.errors import EmptyDataError
+from ragas import evaluate
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from tqdm import tqdm
 
-# ---- Optional Cross-Encoder (re-rank) ----
-try:
-    from sentence_transformers import CrossEncoder
-    CE_AVAILABLE = True
-except Exception:
-    CE_AVAILABLE = False
+from src.config import EVAL_DIR, EVAL_OLLAMA_MODEL, EXPERIMENTS_DIR, get_settings
+from src.eval.common import (
+    cache_key,
+    evidence_hit_ratio,
+    format_scores,
+    is_bad_answer,
+    nan_safe_scores,
+    normalize_ragas_scores,
+    shrink_contexts,
+    str2bool,
+)
+from src.rag import answer_question, get_llm, get_vectorstore, retrieve_context
 
-from src.config import CHROMA_DIR, EMBEDDING_MODEL, OLLAMA_BASE_URL, OLLAMA_MODEL
+try:  # pragma: no cover - depends on the installed ragas version
+    from ragas.metrics import NonLLMContextPrecisionWithReference, NonLLMContextRecall
+except Exception:  # pragma: no cover
+    from ragas.metrics import context_precision as NonLLMContextPrecisionWithReference  # type: ignore
+    from ragas.metrics import context_recall as NonLLMContextRecall  # type: ignore
 
-# ---------------- Defaults ----------------
+try:  # pragma: no cover
+    from ragas.metrics import answer_relevancy, faithfulness
+except Exception:  # pragma: no cover
+    faithfulness = None  # type: ignore
+    answer_relevancy = None  # type: ignore
+
+try:  # pragma: no cover
+    from ragas.llms import LangchainLLMWrapper as LangchainLLM
+except Exception:  # pragma: no cover
+    try:
+        from ragas.integrations.langchain import LangchainLLM  # type: ignore
+    except Exception:
+        LangchainLLM = None  # type: ignore
+
+# --------------------------------------------------------------------------- #
+# Defaults (overridable through the environment)
+# --------------------------------------------------------------------------- #
+_settings = get_settings()
+
 DEFAULT_LIMIT = int(os.getenv("LIMIT", "12"))
 DEFAULT_TRIM_CTX = int(os.getenv("TRIM_CTX", "1200"))
-DEFAULT_K = int(os.getenv("RETRIEVER_K", "6"))
+DEFAULT_K = int(os.getenv("RETRIEVER_K", str(_settings.retriever_k)))
 DEFAULT_PER_CHUNK = int(os.getenv("PER_CHUNK", "360"))
 DEFAULT_FETCH_K = int(os.getenv("FETCH_K", "80"))
 DEFAULT_THR = float(os.getenv("THR", "0.20"))
-DEFAULT_FULL = str(os.getenv("FULL", "true")).lower() in ("1","true","yes")
-DEFAULT_SHOW_DEBUG = str(os.getenv("SHOW_DEBUG", "true")).lower() in ("1","true","yes")
-DEFAULT_RERANK = str(os.getenv("RERANK", "true")).lower() in ("1","true","yes")
-DEFAULT_NO_CACHE = str(os.getenv("NO_CACHE", "false")).lower() in ("1","true","yes")
+DEFAULT_FULL = str(os.getenv("FULL", "true")).lower() in ("1", "true", "yes")
+DEFAULT_SHOW_DEBUG = str(os.getenv("SHOW_DEBUG", "true")).lower() in ("1", "true", "yes")
+DEFAULT_RERANK = str(os.getenv("RERANK", "true")).lower() in ("1", "true", "yes")
+DEFAULT_NO_CACHE = str(os.getenv("NO_CACHE", "false")).lower() in ("1", "true", "yes")
 
-EVAL_MODEL = os.getenv("EVAL_OLLAMA_MODEL", OLLAMA_MODEL)  # LLM for answering / --full scoring
+EVAL_MODEL = EVAL_OLLAMA_MODEL
 
-RAG_PROMPT = ChatPromptTemplate.from_template("""
-Answer strictly from the context. If something is not in the context, say you don't know.
+TESTSET_CSV = EVAL_DIR / "testset.csv"
+ANSWERS_CSV = EVAL_DIR / "run_answers.csv"
+ROW_SCORES_CSV = EXPERIMENTS_DIR / "ragas_row_scores.csv"
+AB_RESULTS_CSV = EXPERIMENTS_DIR / "ab_results.csv"
 
-Respond in two sections:
-1) Evidence: quote the exact lines (verbatim) from the context that support your answer. Use bullet points and keep each quote short.
-2) Answer: a concise synthesis. End with: "Source: <Act/MUTCD, clause #>" when the clause is explicitly present.
+JUDGE_PROMPT = ChatPromptTemplate.from_template(
+    """
+You are a strict ground-truth judge.
+Given the retrieved CONTEXT and the model's ANSWER (with Evidence bullets),
+tell if the answer is fully grounded in the context.
 
---------------------
+Reply only JSON with keys:
+- grounded: true/false
+- reason: short text
+- need_more_context: true/false
+
+CONTEXT:
 {context}
---------------------
-Question: {question}
-""")
 
-# ---------------- Utils ----------------
-def str2bool(v) -> bool:
-    if isinstance(v, bool): return v
-    s = str(v).strip().lower()
-    if s in ("1","true","yes","y","on"):  return True
-    if s in ("0","false","no","n","off"): return False
-    raise argparse.ArgumentTypeError(f"expected boolean, got: {v}")
+ANSWER:
+{answer}
+"""
+)
 
-def answer_question(llm, ctx_joined: str, q: str) -> str:
-    chain = RAG_PROMPT | llm | StrOutputParser()
-    return chain.invoke({"context": ctx_joined, "question": q})
 
-def _cache_key(q: str, args) -> str:
-    return "||".join([
-        q.strip(),
-        f"eval_model={EVAL_MODEL}",
-        f"k={args.k}",
-        f"trim={args.trim_ctx}",
-        f"chunk={args.per_chunk}",
-        f"thr={args.thr}",
-        f"rerank={args.rerank}",
-        f"mmr={args.mmr}",
-    ])
+# --------------------------------------------------------------------------- #
+# Per-row export
+# --------------------------------------------------------------------------- #
+def _pick_column(df: pd.DataFrame, must_have: Sequence[str], fuzzy: Sequence[str]) -> str | None:
+    lower_map = {column.lower(): column for column in df.columns}
+    for name in must_have:
+        if name.lower() in lower_map:
+            return lower_map[name.lower()]
+    for column in df.columns:
+        lowered = column.lower()
+        if all(needle in lowered for needle in fuzzy):
+            return column
+    return None
 
-def _bad_answer(a: str) -> bool:
-    a = (a or "").strip()
-    if len(a) < 50: return True
-    if "Evidence:" not in a or "Answer:" not in a: return True
-    return False
 
-def nan_safe_scores(d: dict) -> dict:
-    out = {}
-    for k, v in (d or {}).items():
-        try: fv = float(v)
-        except Exception: fv = 0.0
-        if math.isnan(fv) or math.isinf(fv): fv = 0.0
-        out[k] = fv
-    return out
+def export_per_row_scores(result: Any, questions: Sequence[str], out_csv: Path = ROW_SCORES_CSV) -> None:
+    """Append per-row context precision / recall for error analysis."""
+    import numpy as np
 
-def normalize_ragas_scores(scores: dict) -> dict:
-    import math as _math
-    clean = {}
-    for k, v in (scores or {}).items():
-        try: fv = float(v)
-        except Exception: fv = 0.0
-        if _math.isnan(fv) or _math.isinf(fv): fv = 0.0
-        clean[k] = fv
+    try:
+        frame = result.to_pandas()
+    except Exception:
+        if hasattr(result, "results") and isinstance(result.results, list):
+            frame = pd.DataFrame(result.results)
+        else:
+            print("[warn] ragas per-row export: cannot obtain dataframe")
+            return
 
-    alias_table = {
-        "context_precision": [
-            "context_precision","context_precision_with_reference",
-            "nonllm_context_precision_with_reference","non_llm_context_precision_with_reference",
-            "retrieval_precision_with_reference",
+    precision_col = _pick_column(
+        frame,
+        must_have=[
+            "context_precision",
+            "context_precision_with_reference",
+            "nonllm_context_precision_with_reference",
+            "non_llm_context_precision_with_reference",
         ],
-        "context_recall": [
-            "context_recall","context_recall_with_reference",
-            "nonllm_context_recall","non_llm_context_recall",
-            "retrieval_recall_with_reference",
+        fuzzy=("context", "precision"),
+    )
+    recall_col = _pick_column(
+        frame,
+        must_have=[
+            "context_recall",
+            "context_recall_with_reference",
+            "nonllm_context_recall",
+            "non_llm_context_recall",
         ],
-        "faithfulness": ["faithfulness","llm_faithfulness"],
-        "answer_relevancy": ["answer_relevancy","response_relevancy","llm_answer_relevancy"],
-    }
-    lower_map = {k.lower(): k for k in clean.keys()}
-    normalized = dict(clean)
-    for canon_key, aliases in alias_table.items():
-        for a in aliases:
-            if a.lower() in lower_map:
-                normalized[canon_key] = clean[lower_map[a.lower()]]
-                break
+        fuzzy=("context", "recall"),
+    )
 
-    def fuzzy_pick(pred):
-        for orig_k in clean.keys():
-            if pred(orig_k.lower()):
-                return clean[orig_k]
-        return None
+    out = pd.DataFrame({"question": list(questions)})
+    out["Context_precision"] = pd.to_numeric(frame[precision_col], errors="coerce") if precision_col else np.nan
+    out["Context_recall"] = pd.to_numeric(frame[recall_col], errors="coerce") if recall_col else np.nan
 
-    if "context_precision" not in normalized:
-        v = fuzzy_pick(lambda lk: ("context" in lk) and ("precision" in lk))
-        if v is not None: normalized["context_precision"] = v
-    if "context_recall" not in normalized:
-        v = fuzzy_pick(lambda lk: ("context" in lk) and ("recall" in lk))
-        if v is not None: normalized["context_recall"] = v
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    header_needed = True
+    if out_csv.exists():
+        try:
+            header_needed = list(pd.read_csv(out_csv, nrows=0).columns) != list(out.columns)
+        except Exception:
+            header_needed = True
+    out.to_csv(out_csv, mode="a", index=False, header=header_needed)
+    print(f"[Saved] per-row RAGAS -> {out_csv} (precision_col={precision_col}, recall_col={recall_col})")
 
-    print("\n=== RAGAS Scores (raw) ===")
-    for k in sorted(clean.keys()):
-        print(f"{k}: {clean[k]:.4f}")
 
-    print("\n=== RAGAS Scores (standardized) ===")
-    for k in ("faithfulness","answer_relevancy","context_precision","context_recall"):
-        if k in normalized:
-            print(f"{k}: {normalized[k]:.4f}")
-    return normalized
-
-def _eval_one_metric(ds_llm, metric, ragas_llm, ragas_emb, max_retries=2, base_wait=8):
-    from ragas import evaluate as ragas_evaluate
+# --------------------------------------------------------------------------- #
+# Optional LLM metrics
+# --------------------------------------------------------------------------- #
+def evaluate_llm_metric(
+    dataset: Dataset,
+    metric: Any,
+    ragas_llm: Any,
+    ragas_emb: Any,
+    max_retries: int = 3,
+    base_wait: float = 8.0,
+) -> dict[str, float] | None:
+    """Score one LLM-based metric with exponential backoff."""
     metric_key = getattr(metric, "name", None) or metric.__class__.__name__
     attempt = 0
     while True:
         try:
-            res = ragas_evaluate(ds_llm, metrics=[metric], llm=ragas_llm, embeddings=ragas_emb)
+            result = evaluate(dataset, metrics=[metric], llm=ragas_llm, embeddings=ragas_emb)
             try:
-                dfm = res.to_pandas()
-                num = dfm.select_dtypes(include=["number"])
-                agg = num.mean(numeric_only=True) if len(dfm) > 1 else num.iloc[0]
-                for k, v in agg.items():
-                    if k.lower() == metric_key.lower():
-                        return {metric_key: float(v)}
-                for k, v in agg.items():
-                    if isinstance(v, (int, float)):
-                        return {metric_key: float(v)}
+                frame = result.to_pandas()
+                numbers = frame.select_dtypes(include=["number"])
+                aggregate = numbers.mean(numeric_only=True) if len(frame) > 1 else numbers.iloc[0]
+                for key, value in aggregate.items():
+                    if str(key).lower() == str(metric_key).lower():
+                        return {metric_key: float(value)}
+                for value in aggregate.values:
+                    if isinstance(value, (int, float)):
+                        return {metric_key: float(value)}
                 return None
             except Exception:
-                if hasattr(res, "scores") and metric_key in getattr(res, "scores", {}):
-                    return {metric_key: float(res.scores.get(metric_key))}
+                scores = getattr(result, "scores", {}) or {}
+                if metric_key in scores:
+                    return {metric_key: float(scores[metric_key])}
                 return None
-        except Exception as e:
+        except Exception as exc:
             attempt += 1
             if attempt > max_retries:
-                print(f"[LLM metric] {metric_key} failed after retries: {e}")
+                print(f"[LLM metric] {metric_key} failed after retries: {exc}")
                 return None
             wait = base_wait * (2 ** (attempt - 1)) + random.uniform(0, 2)
-            print(f"[LLM metric] {metric_key} retry {attempt}/{max_retries} after {wait:.1f}s ... ({e})")
+            print(f"[LLM metric] {metric_key} retry {attempt}/{max_retries} after {wait:.1f}s ({exc})")
             time.sleep(wait)
 
-# ---------------- Retrieval (threshold / MMR / rerank) ----------------
-def retrieve_context(
-    vs, q: str, k: int, trim: int, per_chunk: int = 300,
-    use_mmr: bool = False, mmr_lambda: float = 0.85,
-    fetch_k: int = 50, score_threshold: float | None = 0.25,
-    rerank: bool = False, cross_encoder_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
-) -> Tuple[List[str], str]:
-    cand = vs.similarity_search_with_relevance_scores(q, k=max(fetch_k, k))
-    if score_threshold is not None:
-        cand = [(d, s) for (d, s) in cand if (s is not None and float(s) >= score_threshold)]
-    if not cand:
-        return [], ""
-    docs_sorted = [d for (d, _) in sorted(cand, key=lambda x: x[1], reverse=True)]
 
-    if rerank and CE_AVAILABLE and len(docs_sorted) > k:
-        try:
-            ce = CrossEncoder(cross_encoder_name)
-            pairs = [(q, d.page_content) for d in docs_sorted]
-            scores = ce.predict(pairs)
-            ranked = sorted(zip(docs_sorted, scores), key=lambda x: x[1], reverse=True)
-            docs_final = [d for d, _ in ranked[:k]]
-        except Exception:
-            docs_final = docs_sorted[:k]
-    elif use_mmr and len(docs_sorted) > k:
-        uniq, seen = [], set()
-        for d in docs_sorted:
-            key = (d.page_content[:120].strip(), d.metadata.get("source", ""))
-            if key in seen: continue
-            seen.add(key); uniq.append(d)
-            if len(uniq) >= k: break
-        docs_final = uniq
-    else:
-        docs_final = docs_sorted[:k]
-
-    chunks = [d.page_content[:per_chunk] for d in docs_final]
-    joined = "\n\n".join(chunks)[:trim]
-    return chunks, joined
-
-def _print_debug_sample(q: str, ctx_chunks: List[str], answer: str, topn: int = 3, each_len: int = 280):
-    lines = []
-    lines.append("\n" + "="*72)
-    lines.append("[DEBUG] Question:")
-    lines.append(q.strip())
-    lines.append("\n[DEBUG] Top contexts:")
-    for i, c in enumerate(ctx_chunks[:topn], 1):
-        clip = (c or "")[:each_len].rstrip()
-        lines.append(f"  [{i}] {clip}")
-    lines.append("\n[DEBUG] Answer:")
-    lines.append((answer or "").strip())
-    lines.append("="*72 + "\n")
-    out = "\n".join(lines)
-    print(out)
+# --------------------------------------------------------------------------- #
+# Self-evaluation loop
+# --------------------------------------------------------------------------- #
+def llm_judge(llm: Any, context_joined: str, answer: str) -> dict[str, Any]:
+    """Ask the model whether the answer is grounded (fallback: assume ok)."""
     try:
-        os.makedirs("data/eval", exist_ok=True)
-        with open("data/eval/last_debug.txt", "w", encoding="utf-8") as f:
-            f.write(out)
+        raw = (JUDGE_PROMPT | llm | StrOutputParser()).invoke({"context": context_joined, "answer": answer}).strip()
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = json.loads(raw.splitlines()[-1])
+        return {
+            "grounded": bool(payload.get("grounded", False)),
+            "need_more_context": bool(payload.get("need_more_context", False)),
+            "reason": str(payload.get("reason", ""))[:200],
+        }
+    except Exception:
+        return {"grounded": True, "need_more_context": False, "reason": "judge-fallback"}
+
+
+def retry_with_broader_retrieval(vectorstore: Any, question: str, args: argparse.Namespace):
+    """Widen the search: lower threshold, bigger pool, de-duplication + rerank."""
+    return retrieve_context(
+        vectorstore,
+        question,
+        k=args.k,
+        trim=args.trim_ctx,
+        per_chunk=args.per_chunk,
+        use_mmr=True,
+        mmr_lambda=0.70,
+        fetch_k=max(args.fetch_k, 120),
+        score_threshold=min(args.thr, 0.10) if args.thr is not None else None,
+        rerank=True,
+        cross_encoder_name=args.ce_model,
+    )
+
+
+def improve_answer(llm: Any, vectorstore: Any, question: str, answer: str, chunks, joined, args):
+    """Run one critic pass; return ``(answer, chunks, joined)``."""
+    hit = evidence_hit_ratio(joined, answer)
+    need_retry = hit < args.critic_thr
+    if need_retry and args.judge:
+        verdict = llm_judge(llm, joined, answer)
+        need_retry = (not verdict.get("grounded", True)) or verdict.get("need_more_context", False)
+    if not need_retry:
+        return answer, chunks, joined
+
+    wider_chunks, wider_joined = retry_with_broader_retrieval(vectorstore, question, args)
+    if not wider_joined:
+        return answer, chunks, joined
+
+    retried = answer_question(llm, wider_joined, question)
+    if evidence_hit_ratio(wider_joined, retried) >= hit:
+        return retried, wider_chunks, wider_joined
+    return answer, chunks, joined
+
+
+# --------------------------------------------------------------------------- #
+# Caching
+# --------------------------------------------------------------------------- #
+_CACHE_COLUMNS = ["question", "answer", "context", "ckey"]
+
+
+def load_answer_cache(path: Path) -> dict[str, tuple[str, str, str]]:
+    """Read the answer cache, tolerating legacy / empty / broken files."""
+    cache: dict[str, tuple[str, str, str]] = {}
+    if not path.exists():
+        return cache
+    try:
+        if path.stat().st_size == 0:
+            raise EmptyDataError("empty run_answers.csv")
+        frame = pd.read_csv(path, engine="python", on_bad_lines="skip")
+    except EmptyDataError:
+        return cache
+    except Exception:
+        return cache
+
+    if frame.shape[1] >= 3:
+        frame = frame.iloc[:, :4].copy()
+        if frame.shape[1] == 3:
+            frame.columns = ["question", "answer", "context"]
+            frame["ckey"] = ""
+        else:
+            frame.columns = _CACHE_COLUMNS
+    else:
+        return cache
+
+    for row in frame.itertuples(index=False):
+        cache[str(row.question)] = (str(row.answer), str(row.context), str(row.ckey))
+    return cache
+
+
+def append_answer_cache(path: Path, rows: list[dict[str, str]]) -> None:
+    """Append new answers, migrating a legacy header in place when needed."""
+    if not rows:
+        return
+    frame = pd.DataFrame(rows, columns=_CACHE_COLUMNS)
+    exists = path.exists()
+    legacy = False
+    if exists:
+        try:
+            header = path.read_text(encoding="utf-8").splitlines()[0]
+            legacy = "ckey" not in [part.strip() for part in header.split(",")]
+        except Exception:
+            legacy = False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if exists and legacy:
+        try:
+            old = pd.read_csv(path, engine="python", on_bad_lines="skip")
+        except Exception:
+            old = pd.DataFrame(columns=_CACHE_COLUMNS)
+        if old.shape[1] == 3:
+            old.columns = ["question", "answer", "context"]
+            old["ckey"] = ""
+        pd.concat([old, frame], ignore_index=True).to_csv(path, index=False, quoting=csv.QUOTE_ALL)
+    else:
+        frame.to_csv(path, mode="a", index=False, header=not exists, quoting=csv.QUOTE_ALL)
+    print(f"[cache] appended {len(rows)} rows -> {path}")
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def build_parser(default_loop: bool = False) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    parser.add_argument("--k", type=int, default=DEFAULT_K)
+    parser.add_argument("--trim_ctx", type=int, default=DEFAULT_TRIM_CTX)
+    parser.add_argument("--full", type=str2bool, nargs="?", const=True, default=DEFAULT_FULL)
+    parser.add_argument("--per_chunk", type=int, default=DEFAULT_PER_CHUNK)
+    parser.add_argument("--thr", type=float, default=DEFAULT_THR)
+    parser.add_argument("--fetch_k", type=int, default=DEFAULT_FETCH_K)
+    parser.add_argument("--mmr", action="store_true", default=False)
+    parser.add_argument("--mmr_lambda", type=float, default=0.85)
+    parser.add_argument("--rerank", type=str2bool, nargs="?", const=True, default=DEFAULT_RERANK)
+    parser.add_argument("--ce_model", type=str, default=_settings.cross_encoder_model)
+    parser.add_argument("--show_debug", action="store_true", default=DEFAULT_SHOW_DEBUG)
+    parser.add_argument("--row_idx", type=int, default=None)
+    parser.add_argument("--question_substr", type=str, default=None)
+    parser.add_argument("--no_cache", action="store_true", default=DEFAULT_NO_CACHE)
+    parser.add_argument("--loop", action="store_true", default=default_loop, help="enable the self-evaluation loop")
+    parser.add_argument("--critic_thr", type=float, default=0.80, help="evidence hit ratio required to accept")
+    parser.add_argument("--judge", action="store_true", default=False, help="also ask the LLM judge")
+    parser.add_argument("--testset", type=Path, default=TESTSET_CSV)
+    return parser
+
+
+def select_rows(testsets: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    if not {"question", "ground_truth"}.issubset(testsets.columns):
+        raise SystemExit(
+            f"{args.testset} must contain 'question' and 'ground_truth' columns, found: {list(testsets.columns)}"
+        )
+    if args.row_idx is not None:
+        if not 0 <= args.row_idx < len(testsets):
+            raise IndexError(f"--row_idx out of range (0..{len(testsets) - 1})")
+        selected = testsets.iloc[[args.row_idx]].copy()
+        print(f"[single] row_idx={args.row_idx} -> Q: {selected.iloc[0]['question']}")
+        return selected
+    if args.question_substr:
+        matched = testsets[testsets["question"].astype(str).str.contains(args.question_substr, case=False, na=False)]
+        if matched.empty:
+            raise ValueError(f"--question_substr not matched: {args.question_substr}")
+        selected = matched.iloc[[0]].copy()
+        print(f"[single] question_substr={args.question_substr!r} -> Q: {selected.iloc[0]['question']}")
+        return selected
+    return testsets.head(args.limit).copy()
+
+
+def debug_sample(question: str, chunks: Sequence[str], answer: str, topn: int = 3, each_len: int = 280) -> None:
+    lines = ["\n" + "=" * 72, "[DEBUG] Question:", question.strip(), "\n[DEBUG] Top contexts:"]
+    for index, chunk in enumerate(chunks[:topn], 1):
+        lines.append(f"  [{index}] {(chunk or '')[:each_len].rstrip()}")
+    lines += ["\n[DEBUG] Answer:", (answer or "").strip(), "=" * 72]
+    text = "\n".join(lines)
+    print(text)
+    try:
+        EVAL_DIR.mkdir(parents=True, exist_ok=True)
+        (EVAL_DIR / "last_debug.txt").write_text(text, encoding="utf-8")
     except Exception:
         pass
 
-# ---- shrink contexts for LLM metrics (reduce timeouts) ----
-def _shrink_contexts(ctx_lists: List[List[str]], topn: int = 3, each_len: int = 200) -> List[List[str]]:
-    out = []
-    for lst in ctx_lists:
-        small = [(c or "")[:each_len] for c in (lst or [])][:topn]
-        out.append(small)
-    return out
 
-# --- robust per-row export for Context_precision / Context_recall ---
-def _export_per_row_ragas(result, questions, out_csv="experiments/ragas_row_scores.csv"):
-    import pandas as pd, os, numpy as np
-    try:
-        df = result.to_pandas()
-    except Exception:
-        if hasattr(result, "results") and isinstance(result.results, list):
-            df = pd.DataFrame(result.results)
-        else:
-            print("[warn] ragas per-row export: cannot obtain dataframe"); return
+def main(argv: Sequence[str] | None = None, *, default_loop: bool = False) -> int:
+    args = build_parser(default_loop=default_loop).parse_args(argv)
 
-    def pick_col(df, must_have, fuzzy_keys):
-        cols = list(df.columns)
-        lower_map = {c.lower(): c for c in cols}
-        for name in must_have:
-            if name.lower() in lower_map:
-                return lower_map[name.lower()]
-        for c in cols:
-            lc = c.lower()
-            if all(k in lc for k in fuzzy_keys):
-                return c
-        return None
+    testsets = pd.read_csv(args.testset)
+    frame = select_rows(testsets, args)
 
-    cprec_col = pick_col(
-        df,
-        must_have=[
-            "context_precision", "context_precision_with_reference",
-            "nonllm_context_precision_with_reference",
-            "non_llm_context_precision_with_reference",
-        ],
-        fuzzy_keys=["context","precision"],
-    )
-    crecall_col = pick_col(
-        df,
-        must_have=[
-            "context_recall", "context_recall_with_reference",
-            "nonllm_context_recall", "non_llm_context_recall",
-        ],
-        fuzzy_keys=["context","recall"],
-    )
+    vectorstore = get_vectorstore()
+    llm = get_llm(model=EVAL_MODEL, temperature=0.0, num_predict=320)
+    ragas_embeddings = LangchainEmbeddingsWrapper(LcHFEmb(model_name=_settings.embedding_model))
 
-    out = pd.DataFrame({"question": questions})
-    out["Context_precision"] = pd.to_numeric(df[cprec_col], errors="coerce") if cprec_col else np.nan
-    out["Context_recall"]    = pd.to_numeric(df[crecall_col], errors="coerce") if crecall_col else np.nan
+    cache = {} if args.no_cache else load_answer_cache(ANSWERS_CSV)
 
-    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    # header detection must be robust to empty/broken files
-    header_needed = True
-    if os.path.exists(out_csv):
-        try:
-            existing_cols = list(pd.read_csv(out_csv, nrows=0).columns)
-            header_needed = (existing_cols != list(out.columns))
-        except Exception:
-            header_needed = True
-    out.to_csv(out_csv, mode="a", index=False, header=header_needed)
-    print(f"[Saved] per-row RAGAS -> {out_csv} (prec_col={cprec_col}, rec_col={crecall_col})")
+    rows_out: list[dict[str, str]] = []
+    questions: list[str] = []
+    answers: list[str] = []
+    contexts: list[list[str]] = []
+    ground_truths: list[str] = []
+    reference_contexts: list[list[str]] = []
 
-# ---------------- Main ----------------
-def main():
-    p = argparse.ArgumentParser()
-
-    # Core evaluation knobs
-    p.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
-    p.add_argument("--k", type=int, default=DEFAULT_K)
-    p.add_argument("--trim_ctx", type=int, default=DEFAULT_TRIM_CTX)
-    p.add_argument("--full", type=str2bool, nargs="?", const=True, default=DEFAULT_FULL)
-
-    # Retrieval & filtering knobs
-    p.add_argument("--per_chunk", type=int, default=DEFAULT_PER_CHUNK)
-    p.add_argument("--thr", type=float, default=DEFAULT_THR)
-    p.add_argument("--fetch_k", type=int, default=DEFAULT_FETCH_K)
-    p.add_argument("--mmr", action="store_true", default=False)
-    p.add_argument("--mmr_lambda", type=float, default=0.85)
-    p.add_argument("--rerank", type=str2bool, nargs="?", const=True, default=DEFAULT_RERANK)
-    p.add_argument("--ce_model", type=str, default="cross-encoder/ms-marco-MiniLM-L-6-v2")
-    p.add_argument("--show_debug", action="store_true", default=DEFAULT_SHOW_DEBUG)
-
-    # Single-sample controls
-    p.add_argument("--row_idx", type=int, default=None)
-    p.add_argument("--question_substr", type=str, default=None)
-    p.add_argument("--no_cache", action="store_true", default=DEFAULT_NO_CACHE)
-
-    args = p.parse_args()
-
-    # Load testset
-    df_all = pd.read_csv("data/eval/testset.csv")
-    assert {"question", "ground_truth"}.issubset(df_all.columns)
-
-    # --- pick single row if requested ---
-    if args.row_idx is not None:
-        if not (0 <= args.row_idx < len(df_all)):
-            raise IndexError(f"--row_idx out of range (0..{len(df_all)-1})")
-        df = df_all.iloc[[args.row_idx]].copy()
-        print(f"[single] use row_idx={args.row_idx} → Q: {df.iloc[0]['question']}")
-    elif args.question_substr:
-        m = df_all[df_all["question"].astype(str).str.contains(args.question_substr, case=False, na=False)]
-        if m.empty:
-            raise ValueError(f"--question_substr not matched: {args.question_substr}")
-        df = m.iloc[[0]].copy()
-        print(f"[single] use question_substr='{args.question_substr}' → Q: {df.iloc[0]['question']}")
-    else:
-        df = df_all.head(args.limit).copy()
-
-    # Retrieval embeddings (LangChain)
-    lc_embeddings = LCHFEmbeddings(model_name=EMBEDDING_MODEL)
-    vs = Chroma(
-        collection_name="qld_rr_docs",
-        embedding_function=lc_embeddings,
-        persist_directory=CHROMA_DIR,
-    )
-
-    # RAGAS-side embeddings (no OpenAI)
-    ragas_emb = RagasHFEmbeddings(model=EMBEDDING_MODEL)
-
-    # Answering LLM
-    llm = ChatOllama(
-        model=EVAL_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        api_key="ollama",
-        temperature=0.0,
-        num_predict=320,
-    )
-    ragas_emb_eval = LangchainEmbeddingsWrapper(LcHFEmb(model_name=EMBEDDING_MODEL))
-
-    # Cache answers
-    os.makedirs("data/eval", exist_ok=True)
-    cache_csv = "data/eval/run_answers.csv"
-    cache = {}
-    if os.path.exists(cache_csv) and not args.no_cache:
-        try:
-            if os.path.getsize(cache_csv) == 0:
-                raise EmptyDataError("empty run_answers.csv")
-            tmp = pd.read_csv(cache_csv, engine="python", on_bad_lines="skip")
-        except EmptyDataError:
-            tmp = pd.DataFrame(columns=["question","answer","context","ckey"])
-        except Exception:
-            tmp = pd.DataFrame(columns=["question","answer","context","ckey"])
-
-        cols = list(tmp.columns)
-        if len(cols) >= 3:
-            tmp = tmp.iloc[:, :min(4, len(cols))].copy()
-            if len(tmp.columns) == 3:
-                tmp.columns = ["question","answer","context"]
-                tmp["ckey"] = ""
-            else:
-                tmp.columns = ["question","answer","context","ckey"]
-        else:
-            tmp = pd.DataFrame(columns=["question","answer","context","ckey"])
-
-        for _, r in tmp.iterrows():
-            q = str(r.get("question","")); a = str(r.get("answer",""))
-            c = str(r.get("context",""));  k = str(r.get("ckey",""))
-            cache[q] = (a, c, k)
-
-    rows_out = []
-    questions, answers, contexts, gts = [], [], [], []
-    ref_ctx_rows = []
-
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="[answer]"):
-        q = str(row["question"])
-        ctx_chunks, ctx_joined = retrieve_context(
-            vs, q, k=args.k, trim=args.trim_ctx,
+    for _, row in tqdm(frame.iterrows(), total=len(frame), desc="[answer]"):
+        question = str(row["question"])
+        chunks, joined = retrieve_context(
+            vectorstore,
+            question,
+            k=args.k,
+            trim=args.trim_ctx,
             per_chunk=args.per_chunk,
-            use_mmr=args.mmr, mmr_lambda=args.mmr_lambda, fetch_k=args.fetch_k,
+            use_mmr=args.mmr,
+            mmr_lambda=args.mmr_lambda,
+            fetch_k=args.fetch_k,
             score_threshold=args.thr,
-            rerank=args.rerank, cross_encoder_name=args.ce_model,
+            rerank=args.rerank,
+            cross_encoder_name=args.ce_model,
         )
 
-        ckey = _cache_key(q, args)
-        cached = cache.get(q)  # (answer, context, cached_ckey)
-        use_cache = (
+        key = cache_key(question, args, EVAL_MODEL)
+        cached = cache.get(question)
+        use_cache = bool(
             (not args.no_cache)
-            and cached and cached[0]
-            and (not _bad_answer(cached[0]))
-            and (cached[2] == "" or cached[2] == ckey)
+            and cached
+            and cached[0]
+            and not is_bad_answer(cached[0])
+            and (cached[2] == "" or cached[2] == key)
         )
 
         if use_cache:
-            a = cached[0]
+            answer = cached[0]
         else:
-            a = answer_question(llm, ctx_joined, q)
-            rows_out.append({"question": q, "answer": a, "context": ctx_joined, "ckey": ckey})
+            answer = answer_question(llm, joined, question)
+            if args.loop:
+                answer, chunks, joined = improve_answer(llm, vectorstore, question, answer, chunks, joined, args)
+            rows_out.append({"question": question, "answer": answer, "context": joined, "ckey": key})
 
         if args.show_debug:
-            _print_debug_sample(q, ctx_chunks, a, topn=3, each_len=args.per_chunk)
+            debug_sample(question, chunks, answer, topn=3, each_len=args.per_chunk)
 
-        questions.append(q)
-        answers.append(a)
-        contexts.append(ctx_chunks)   # List[str]
-        gts.append(str(row["ground_truth"]))
+        questions.append(question)
+        answers.append(answer)
+        contexts.append(chunks)
+        ground_truths.append(str(row["ground_truth"]))
 
-        if "ref_context" in df.columns:
-            raw = row.get("ref_context", None)
-            rc = "" if pd.isna(raw) else str(raw)
-            rc = rc.strip()
-            ref_ctx_rows.append([rc] if rc else list(ctx_chunks))
-        else:
-            ref_ctx_rows.append(list(ctx_chunks))
+        raw_reference = row.get("ref_context", None)
+        reference = "" if raw_reference is None or pd.isna(raw_reference) else str(raw_reference).strip()
+        reference_contexts.append([reference] if reference else list(chunks))
 
-    if rows_out:
-        df_out = pd.DataFrame(rows_out, columns=["question","answer","context","ckey"])
-        file_exists = os.path.exists(cache_csv)
+    append_answer_cache(ANSWERS_CSV, rows_out)
 
-        need_migrate = False
-        if file_exists:
-            try:
-                with open(cache_csv, "r", encoding="utf-8") as f:
-                    header_line = f.readline().strip()
-                need_migrate = ("ckey" not in [h.strip() for h in header_line.split(",")])
-            except Exception:
-                need_migrate = False
+    dataset = Dataset.from_dict(
+        {
+            "user_input": questions,
+            "retrieved_contexts": contexts,
+            "reference_contexts": reference_contexts,
+            "response": answers,
+            "reference": ground_truths,
+        }
+    )
 
-        if file_exists and need_migrate:
-            try:
-                tmp = pd.read_csv(cache_csv, engine="python", on_bad_lines="skip")
-            except Exception:
-                tmp = pd.DataFrame(columns=["question","answer","context","ckey"])
-            cols = list(tmp.columns)
-            if len(cols) >= 3:
-                tmp = tmp.iloc[:, :min(4, len(cols))].copy()
-                if len(tmp.columns) == 3:
-                    tmp.columns = ["question","answer","context"]; tmp["ckey"] = ""
-                else:
-                    tmp.columns = ["question","answer","context","ckey"]
-            else:
-                tmp = pd.DataFrame(columns=["question","answer","context","ckey"])
-            all_df = pd.concat([tmp, df_out], ignore_index=True)
-            all_df.to_csv(cache_csv, index=False, quoting=csv.QUOTE_ALL)
-        else:
-            df_out.to_csv(cache_csv, mode="a", index=False, header=not file_exists, quoting=csv.QUOTE_ALL)
-        print(f"[cache] appended {len(rows_out)} rows -> {cache_csv}")
-
-    # RAGAS schema（Non-LLM metrics）
-    ds = Dataset.from_dict({
-        "user_input": questions,
-        "retrieved_contexts": contexts,      # List[List[str]]
-        "reference_contexts": ref_ctx_rows,  # List[List[str]]
-        "response": answers,
-        "reference": gts,
-    })
-
-    # Conservative concurrency/timeout for ragas internals
     os.environ.setdefault("RAGAS_CONCURRENCY", "1")
     os.environ.setdefault("RAGAS_TIMEOUT", "1200")
 
-    # Optional LLM metrics
-    extra_llm_scores = {}
+    extra_scores: dict[str, float] = {}
     if args.full and LangchainLLM is not None and faithfulness is not None and answer_relevancy is not None:
         ragas_llm = LangchainLLM(llm)
-        ds_llm = Dataset.from_dict({
-            "user_input": questions,
-            "retrieved_contexts": _shrink_contexts(contexts, topn=3, each_len=320),
-            "reference_contexts": _shrink_contexts(ref_ctx_rows, topn=3, each_len=320),
-            "response": answers,
-            "reference": gts,
-        })
-        s_faith = _eval_one_metric(ds_llm, faithfulness, ragas_llm, ragas_emb_eval,
-                                   max_retries=3, base_wait=8) or {}
-        s_rel   = _eval_one_metric(ds_llm, answer_relevancy, ragas_llm, ragas_emb_eval,
-                                   max_retries=3, base_wait=8) or {}
-        extra_llm_scores = {**s_faith, **s_rel}
-        if args.show_debug:
-            print("[DEBUG] LLM-metrics contexts (shrunken):")
-            for i, lst in enumerate(_shrink_contexts(contexts, topn=3, each_len=320)[:1], 1):
-                for j, c in enumerate(lst, 1):
-                    print(f"  ({i}.{j}) {c}")
+        dataset_llm = Dataset.from_dict(
+            {
+                "user_input": questions,
+                "retrieved_contexts": shrink_contexts(contexts, topn=3, each_len=320),
+                "reference_contexts": shrink_contexts(reference_contexts, topn=3, each_len=320),
+                "response": answers,
+                "reference": ground_truths,
+            }
+        )
+        extra_scores = {
+            **(evaluate_llm_metric(dataset_llm, faithfulness, ragas_llm, ragas_embeddings) or {}),
+            **(evaluate_llm_metric(dataset_llm, answer_relevancy, ragas_llm, ragas_embeddings) or {}),
+        }
 
-    # Non-LLM metrics（always）
     metrics = [NonLLMContextPrecisionWithReference(), NonLLMContextRecall()]
-    result = evaluate(ds, metrics=metrics, embeddings=ragas_emb_eval)
+    result = evaluate(dataset, metrics=metrics, embeddings=ragas_embeddings)
+    export_per_row_scores(result, questions)
 
-    # --- write per-row Non-LLM metrics (Context_precision / Context_recall) ---
-    _export_per_row_ragas(result, questions, out_csv="experiments/ragas_row_scores.csv")
-
-    scores = {}
+    scores: dict[str, float] = {}
     try:
-        df_scores = result.to_pandas()
-        num = df_scores.select_dtypes(include=["number"])
-        agg = num.mean(numeric_only=True) if len(df_scores) > 1 else num.iloc[0]
-        scores = {k: float(v) for k, v in agg.items()}
+        frame_scores = result.to_pandas()
+        numbers = frame_scores.select_dtypes(include=["number"])
+        aggregate = numbers.mean(numeric_only=True) if len(frame_scores) > 1 else numbers.iloc[0]
+        scores = {str(key): float(value) for key, value in aggregate.items()}
     except Exception:
         if hasattr(result, "scores"):
-            scores = {k: float(v) for k, v in result.scores.items()}
+            scores = {str(key): float(value) for key, value in result.scores.items()}
 
-    # Merge -> sanitize -> normalize -> print
-    scores = {**extra_llm_scores, **scores}
-    scores = nan_safe_scores(scores)
-    scores = normalize_ragas_scores(scores)
+    raw_scores = nan_safe_scores({**extra_scores, **scores})
+    print("\n" + format_scores(raw_scores, "RAGAS Scores (raw)"))
+    normalized = normalize_ragas_scores(raw_scores)
+    print(
+        "\n"
+        + format_scores(
+            {
+                k: normalized[k]
+                for k in ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
+                if k in normalized
+            },
+            "RAGAS Scores (standardized)",
+        )
+    )
 
-    # Persist (aggregated view)
-    os.makedirs("experiments", exist_ok=True)
-    csv_path = "experiments/ab_results.csv"
-    is_new = not os.path.exists(csv_path)
-    with open(csv_path, "a", newline="") as f:
+    EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    is_new = not AB_RESULTS_CSV.exists()
+    with AB_RESULTS_CSV.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
-            f,
+            handle,
             fieldnames=[
-                "ts","embed_model","retriever_k","limit","trim_ctx","eval_model",
-                "faithfulness","answer_relevancy","context_precision","context_recall",
+                "ts",
+                "embed_model",
+                "retriever_k",
+                "limit",
+                "trim_ctx",
+                "eval_model",
+                "faithfulness",
+                "answer_relevancy",
+                "context_precision",
+                "context_recall",
             ],
         )
         if is_new:
             writer.writeheader()
-        writer.writerow({
-            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "embed_model": EMBEDDING_MODEL,
-            "retriever_k": args.k,
-            "limit": len(df),
-            "trim_ctx": args.trim_ctx,
-            "eval_model": EVAL_MODEL,
-            "faithfulness": f"{scores.get('faithfulness', 0.0):.4f}",
-            "answer_relevancy": f"{scores.get('answer_relevancy', 0.0):.4f}",
-            "context_precision": f"{scores.get('context_precision', 0.0):.4f}",
-            "context_recall": f"{scores.get('context_recall', 0.0):.4f}",
-        })
-    print("[Saved] experiments/ab_results.csv updated.")
+        writer.writerow(
+            {
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "embed_model": _settings.embedding_model,
+                "retriever_k": args.k,
+                "limit": len(frame),
+                "trim_ctx": args.trim_ctx,
+                "eval_model": EVAL_MODEL,
+                "faithfulness": f"{normalized.get('faithfulness', 0.0):.4f}",
+                "answer_relevancy": f"{normalized.get('answer_relevancy', 0.0):.4f}",
+                "context_precision": f"{normalized.get('context_precision', 0.0):.4f}",
+                "context_recall": f"{normalized.get('context_recall', 0.0):.4f}",
+            }
+        )
+    print(f"[Saved] {AB_RESULTS_CSV}")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,23 +1,43 @@
-import json, random, re, ast
+"""Generate a RAGAS test set (question / ground truth / reference context).
+
+Fixes vs. the original
+----------------------
+* paths come from :mod:`src.config` (no more ``data/eval/testset.csv`` relative
+  to whatever directory you happened to launch from);
+* the vector store and the model are obtained from the shared factories, so the
+  embedding model is not re-loaded twice;
+* a row produced by the "plain + parser" fallback now consistently keeps
+  ``ref_context`` (the old code dropped it, which silently degraded
+  context-recall for those rows).
+
+    python -m src.eval.gen_testset --n 30
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import random
+import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Optional
+from typing import Any
 
 import pandas as pd
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
 from tqdm import tqdm
 
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-from langchain_ollama import ChatOllama
-from langchain_core.output_parsers import JsonOutputParser
-from pydantic import BaseModel, Field
-from langchain_core.prompts import ChatPromptTemplate
+from src.config import get_settings
+from src.rag import get_llm, get_vectorstore
 
-from src.config import CHROMA_DIR, EMBEDDING_MODEL, OLLAMA_BASE_URL, OLLAMA_MODEL
 
-# ---------- Structured output schema ----------
 class QA(BaseModel):
     question: str = Field(..., description="User question")
     ground_truth: str = Field(..., description="Short factual answer from snippet")
+
 
 parser = JsonOutputParser(pydantic_object=QA)
 
@@ -31,107 +51,103 @@ Snippet:
 """
 )
 
-def coerce_json_to_pair(text: str) -> Optional[dict]:
-    txt = text.strip()
-    txt = re.sub(r"^```(?:json)?|```$", "", txt, flags=re.MULTILINE).strip()
-    i, j = txt.find("{"), txt.rfind("}")
-    if i >= 0 and j > i:
-        chunk = txt[i:j+1]
-        for loader in (json.loads, ast.literal_eval):
-            try:
-                obj = loader(chunk)
-                q = str(obj.get("question","")).strip()
-                a = str(obj.get("ground_truth","")).strip()
-                if q and a:
-                    return {"question": q, "ground_truth": a}
-            except Exception:
-                pass
+SNIPPET_TRIM = 500
+MAX_TOKENS = 128
+
+
+def coerce_json_to_pair(text: str) -> dict[str, str] | None:
+    """Best-effort extraction of a QA pair from a messy model response."""
+    cleaned = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    candidate = cleaned[start : end + 1]
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            obj = loader(candidate)
+        except Exception:
+            continue
+        question = str(obj.get("question", "")).strip()
+        answer = str(obj.get("ground_truth", "")).strip()
+        if question and answer:
+            return {"question": question, "ground_truth": answer}
     return None
 
-OUT_CSV = Path("data/eval/testset.csv")
 
-def sample_snippets(k=30) -> List[str]:
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-    vs = Chroma(collection_name="qld_rr_docs", embedding_function=embeddings, persist_directory=CHROMA_DIR)
-    raw = vs.get()
-    docs = raw.get("documents", [])
-    if not docs:
-        raise RuntimeError("Vector store empty. Run ingest.py first.")
-    k = min(k, len(docs))
-    return random.sample(docs, k)
+def sample_snippets(k: int = 30) -> list[str]:
+    """Draw ``k`` random chunk texts from the vector store."""
+    documents = get_vectorstore().get().get("documents", [])
+    if not documents:
+        raise RuntimeError("Vector store is empty. Run `python -m src.ingest` first.")
+    return random.sample(documents, min(k, len(documents)))
 
-TRIM = 500    
-MAX_TOK = 128  
 
-def generate_pairs(snippets: List[str]):
+def generate_pairs(snippets: Sequence[str]) -> list[dict[str, str]]:
+    model = get_llm(temperature=0.1, num_predict=MAX_TOKENS)
+    model_json = get_llm(temperature=0.1, num_predict=MAX_TOKENS, json_mode=True)
+    format_instructions = parser.get_format_instructions()
 
-    llm_json = ChatOllama(
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        api_key="ollama",
-        temperature=0.1,
-        num_predict=MAX_TOK,
-        format="json",         
-    )
-    llm_plain = ChatOllama(
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        api_key="ollama",
-        temperature=0.1,
-        num_predict=MAX_TOK,
-    )
+    rows: list[dict[str, str]] = []
+    for index, snippet in enumerate(tqdm(snippets, desc="[gen]"), 1):
+        trimmed = snippet[:SNIPPET_TRIM]
+        payload: dict[str, Any] = {"snippet": trimmed, "format_instructions": format_instructions}
 
-    rows = []
-    total = len(snippets)
-    fmt = {"format_instructions": parser.get_format_instructions()}
-
-    for i, s in enumerate(tqdm(snippets, desc="[gen]"), 1):
-        s = s[:TRIM]
-
+        # 1) JSON-mode call
         try:
-            raw = (PROMPT | llm_json).invoke({"snippet": s, **fmt}).content
+            raw = (PROMPT | model_json).invoke(payload).content
             obj = json.loads(raw)
-            q = obj.get("question","").strip()
-            a = obj.get("ground_truth","").strip()
-            if q and a:
-                rows.append({"question": q, "ground_truth": a, "ref_context": s})
+            question = str(obj.get("question", "")).strip()
+            answer = str(obj.get("ground_truth", "")).strip()
+            if question and answer:
+                rows.append({"question": question, "ground_truth": answer, "ref_context": trimmed})
                 continue
         except Exception:
             pass
 
+        # 2) structured output parser
         try:
-            out = (PROMPT | llm_plain | parser).invoke({"snippet": s, **fmt})
-            rows.append({"question": out["question"].strip(), "ground_truth": out["ground_truth"].strip()})
-            continue
+            parsed = (PROMPT | model | parser).invoke(payload)
+            question = str(parsed["question"]).strip()
+            answer = str(parsed["ground_truth"]).strip()
+            if question and answer:
+                rows.append({"question": question, "ground_truth": answer, "ref_context": trimmed})
+                continue
         except Exception:
             pass
 
+        # 3) last resort: regex/literal-eval extraction
         try:
-            raw2 = (PROMPT | llm_plain).invoke({"snippet": s, **fmt}).content
-            pair = coerce_json_to_pair(raw2)
+            raw = (PROMPT | model).invoke(payload).content
+            pair = coerce_json_to_pair(raw)
             if pair:
+                pair["ref_context"] = trimmed
                 rows.append(pair)
-            else:
-
-                if i <= 3:
-                    print("[debug raw]", raw2[:300].replace("\n", " "))
+            elif index <= 3:
+                print("[debug raw]", raw[:300].replace("\n", " "))
         except Exception:
             pass
-
     return rows
 
-def main(n: int = 30):
-    OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
-    snippets = sample_snippets(n)
+
+def main(argv: list[str] | None = None) -> int:
+    cli = argparse.ArgumentParser(description="Generate a RAGAS test set from the corpus.")
+    cli.add_argument("--n", type=int, default=30, help="number of snippets to sample")
+    cli.add_argument("--out", type=Path, default=None, help="output CSV path")
+    args = cli.parse_args(argv)
+
+    out = args.out or (get_settings().eval_dir / "testset.csv")
+    snippets = sample_snippets(args.n)
     rows = generate_pairs(snippets)
     if not rows:
-        raise RuntimeError("No pairs generated. Try smaller n, smaller TRIM, and ensure OLLAMA_MODEL is qwen2.5:1.5b.")
-    pd.DataFrame(rows).to_csv(OUT_CSV, index=False)
-    print(f"[gen] Saved {len(rows)} rows to {OUT_CSV} (ok={len(rows)}/{len(snippets)})")
+        raise SystemExit(
+            "No QA pairs generated. Try a smaller --n or a stronger OLLAMA_MODEL "
+            "(the snippet may be too long for a 1.5B model)."
+        )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(out, index=False)
+    print(f"[gen] Saved {len(rows)} rows to {out} (ok={len(rows)}/{len(snippets)})")
+    return 0
+
 
 if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--n", type=int, default=30)
-    args = p.parse_args()
-    main(args.n)
+    raise SystemExit(main())

@@ -1,5 +1,38 @@
-from langchain.prompts import ChatPromptTemplate
+"""Prompt templates used across the project.
 
+Three flavours exist on purpose:
+
+* :data:`RAG_ANSWER_PROMPT` -- the "Evidence / Answer" template.  Every
+  evaluation script and the HTTP API use it, so scores stay comparable with the
+  ``experiments/*.csv`` history.
+* :data:`RAG_FALLBACK` -- a shorter, single-paragraph template for the
+  interactive agent (fast on small local models).
+* :data:`EVAL_TEMPLATE` / :data:`GEN_QA_TEMPLATE` -- grading / test-set
+  generation helpers.
+"""
+
+from __future__ import annotations
+
+from langchain_core.prompts import ChatPromptTemplate
+
+#: Serving + evaluation template (kept byte-identical to the historical one so
+#: cached answers in ``data/eval/run_answers.csv`` remain valid).
+RAG_ANSWER_PROMPT = ChatPromptTemplate.from_template(
+    """
+Answer strictly from the context. If something is not in the context, say you don't know.
+
+Respond in two sections:
+1) Evidence: quote the exact lines (verbatim) from the context that support your answer. Use bullet points and keep each quote short.
+2) Answer: a concise synthesis. End with: "Source: <Act/MUTCD, clause #>" when the clause is explicitly present.
+
+--------------------
+{context}
+--------------------
+Question: {question}
+"""
+)
+
+#: Compact template used by the interactive agent (``src.app_graph``).
 RAG_FALLBACK = ChatPromptTemplate.from_template(
     """
     You are a careful assistant for Queensland road rules. Answer strictly based on the provided context.
@@ -16,7 +49,6 @@ RAG_FALLBACK = ChatPromptTemplate.from_template(
     """
 )
 
-
 EVAL_TEMPLATE = ChatPromptTemplate.from_template(
     """
     You are grading a QA for Queensland road rules.
@@ -29,9 +61,9 @@ EVAL_TEMPLATE = ChatPromptTemplate.from_template(
 
 
     Please output a JSON with fields:
-    - correctness: one of ["yes", "no"] 
-    - relevance: one of ["high", "medium", "low"] 
-    - faithfulness: one of ["yes", "no"] 
+    - correctness: one of ["yes", "no"]
+    - relevance: one of ["high", "medium", "low"]
+    - faithfulness: one of ["yes", "no"]
     - rationale: short explanation in English
     """
 )
@@ -49,3 +81,5 @@ GEN_QA_TEMPLATE = ChatPromptTemplate.from_template(
     Output JSON with fields: question, ground_truth.
     """
 )
+
+__all__ = ["EVAL_TEMPLATE", "GEN_QA_TEMPLATE", "RAG_ANSWER_PROMPT", "RAG_FALLBACK"]

@@ -1,70 +1,184 @@
-# serve_api.py
-from fastapi import FastAPI, Request
+"""FastAPI entrypoint -- OpenWebUI / curl compatible.
+
+Fixes vs. the original
+----------------------
+* no longer imports ``src.eval.eval_ragas`` (a 600-line evaluation script that
+  dragged in ``ragas``, ``datasets`` and ``pandas`` just to expose two helpers);
+  it now talks to :mod:`src.rag` directly;
+* ``on_event("startup")`` (removed in modern FastAPI) replaced by a ``lifespan``
+  handler;
+* CORS is configured from ``CORS_ORIGINS`` instead of hard-coding a personal GCP
+  IP and ``"*"`` (``allow_origins=["*"]`` + ``allow_credentials=True`` is
+  rejected by browsers anyway);
+* optional ``SERVE_API_KEY`` bearer protection for public deployments;
+* responses report the retrieved sources so answers are auditable.
+
+Run it::
+
+    uvicorn serve_api:app --host 127.0.0.1 --port 8008
+    # or
+    python -m serve_api
+"""
+
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from src.eval.eval_ragas import retrieve_context, answer_question
-from langchain_huggingface import HuggingFaceEmbeddings as LCHFEmbeddings
-from langchain_chroma import Chroma
-from langchain_ollama import ChatOllama
-from src.config import CHROMA_DIR, EMBEDDING_MODEL, OLLAMA_BASE_URL, OLLAMA_MODEL
-
-app = FastAPI()
-
-# 允许从你的 WebUI 域/端口访问（偷懒可用 "*"）
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://35.189.26.182:3000", "http://localhost:3000", "http://127.0.0.1:3000", "*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from src.config import get_settings
+from src.rag import (
+    answer_question,
+    get_llm,
+    get_vectorstore,
+    retrieve_documents,
+    vectorstore_is_empty,
 )
+from src.rag.ranking import assemble_context
 
-@app.on_event("startup")
-def init_services():
-    # 运行时再初始化，避免导入时因为依赖/网络失败导致 uvicorn 直接退出
-    app.state.emb = LCHFEmbeddings(model_name=EMBEDDING_MODEL)
-    app.state.vs  = Chroma(
-        collection_name="qld_rr_docs",
-        embedding_function=app.state.emb,
-        persist_directory=CHROMA_DIR
-    )
-    app.state.llm = ChatOllama(
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_BASE_URL,  # 建议设为 http://127.0.0.1:11434
-        api_key="ollama",
-        temperature=0.0
-    )
+logger = logging.getLogger("qld_agentic_rag.api")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
+
+# --------------------------------------------------------------------------- #
+# Schemas
+# --------------------------------------------------------------------------- #
 class AskIn(BaseModel):
-    question: str
-    k: int = 10
-    trim_ctx: int = 900
-    per_chunk: int = 300
-    fetch_k: int = 80
-    thr: float | None = 0.25
-    rerank: bool = False
-    mmr: bool = False
+    question: str = Field(..., min_length=2, description="User question")
+    k: int | None = Field(None, ge=1, le=50, description="Documents to keep")
+    trim_ctx: int | None = Field(None, ge=200, le=8000, description="Max characters of context")
+    per_chunk: int | None = Field(None, ge=100, le=4000, description="Max characters per chunk")
+    fetch_k: int | None = Field(None, ge=1, le=500, description="Candidates pulled from the index")
+    thr: float | None = Field(None, ge=0.0, le=1.0, description="Relevance threshold (0 disables)")
+    rerank: bool | None = Field(None, description="Enable cross-encoder re-ranking")
+    mmr: bool | None = Field(None, description="De-duplicate near-identical chunks")
+
+
+class Source(BaseModel):
+    source: str
+    page: int | None = None
+    preview: str
+
 
 class AskOut(BaseModel):
     answer: str
     context: str
     chunks: list[str]
+    sources: list[Source]
+
+
+# --------------------------------------------------------------------------- #
+# App
+# --------------------------------------------------------------------------- #
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Warm the heavy objects once, at startup (not at import)."""
+    settings = get_settings()
+    if settings.langsmith_tracing and settings.langsmith_api_key:
+        import os
+
+        os.environ.setdefault("LANGSMITH_TRACING", "true")
+        os.environ.setdefault("LANGSMITH_API_KEY", settings.langsmith_api_key)
+        os.environ.setdefault("LANGSMITH_PROJECT", settings.langsmith_project)
+
+    logger.info("loading vector store from %s", settings.chroma_dir)
+    app.state.vectorstore = get_vectorstore()
+    app.state.llm = get_llm(temperature=0.0)
+    if vectorstore_is_empty(app.state.vectorstore):
+        logger.warning("vector store is empty -- run `python -m src.ingest` before serving")
+    yield
+    logger.info("shutting down")
+
+
+app = FastAPI(title="QLD Agentic RAG", version="2.0.0", lifespan=lifespan)
+
+_settings = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(_settings.cors_origins) or ["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+
+def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    """Reject unauthenticated calls when ``SERVE_API_KEY`` is configured."""
+    expected = get_settings().serve_api_key
+    if expected and x_api_key != expected:
+        raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
+
 
 @app.get("/healthz")
-def healthz():
+def healthz() -> dict[str, bool]:
     return {"ok": True}
 
-@app.post("/ask", response_model=AskOut)
-def ask(payload: AskIn, request: Request):
-    vs  = request.app.state.vs
-    llm = request.app.state.llm
-    chunks, joined = retrieve_context(
-        vs, payload.question,
-        k=payload.k, trim=payload.trim_ctx,
-        per_chunk=payload.per_chunk,
-        use_mmr=payload.mmr, fetch_k=payload.fetch_k,
-        score_threshold=payload.thr, rerank=payload.rerank
+
+@app.get("/readyz")
+def readyz(request: Request) -> dict[str, Any]:
+    store = getattr(request.app.state, "vectorstore", None)
+    return {
+        "ready": store is not None and not vectorstore_is_empty(store),
+        "chroma_dir": str(get_settings().chroma_dir),
+    }
+
+
+@app.post("/ask", response_model=AskOut, dependencies=[Depends(require_api_key)])
+def ask(payload: AskIn, request: Request) -> AskOut:
+    settings = get_settings()
+    store = getattr(request.app.state, "vectorstore", None) or get_vectorstore()
+    llm = getattr(request.app.state, "llm", None) or get_llm(temperature=0.0)
+
+    documents = retrieve_documents(
+        store,
+        payload.question,
+        k=payload.k if payload.k is not None else settings.retriever_k,
+        fetch_k=payload.fetch_k if payload.fetch_k is not None else settings.fetch_k,
+        score_threshold=payload.thr if payload.thr is not None else settings.score_threshold,
+        rerank_enabled=payload.rerank if payload.rerank is not None else settings.rerank,
+        use_mmr=bool(payload.mmr),
     )
-    ans = answer_question(llm, joined, payload.question)
-    return AskOut(answer=ans, context=joined, chunks=chunks)
+    chunks, joined = assemble_context(
+        documents,
+        per_chunk=payload.per_chunk if payload.per_chunk is not None else settings.per_chunk,
+        trim=payload.trim_ctx if payload.trim_ctx is not None else settings.trim_ctx,
+    )
+
+    if not joined:
+        logger.info("no context above threshold for %r", payload.question[:80])
+        return AskOut(
+            answer="I don't know. No clause in the indexed corpus matched this question.",
+            context="",
+            chunks=[],
+            sources=[],
+        )
+
+    answer = answer_question(llm, joined, payload.question)
+    return AskOut(
+        answer=answer,
+        context=joined,
+        chunks=chunks,
+        sources=[
+            Source(
+                source=str(doc.metadata.get("source", "unknown")),
+                page=doc.metadata.get("page"),
+                preview=(doc.page_content or "")[:160],
+            )
+            for doc in documents
+        ],
+    )
+
+
+def main() -> None:  # pragma: no cover - convenience entrypoint
+    import uvicorn
+
+    settings = get_settings()
+    uvicorn.run("serve_api:app", host=settings.api_host, port=settings.api_port, reload=False)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
